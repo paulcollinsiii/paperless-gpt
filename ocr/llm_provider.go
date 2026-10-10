@@ -440,9 +440,13 @@ func createOllamaClient(config Config) (llms.Model, error) {
 	if config.OllamaContextLength > 0 {
 		opts = append(opts, ollama.WithRunnerNumCtx(config.OllamaContextLength))
 	}
-	if client := OllamaHTTPClient(); client != nil {
-		opts = append(opts, ollama.WithHTTPClient(client))
+	// Always supply a client so a 502/503 from a stopped or starting Ollama is
+	// reported as ErrBackendUnavailable instead of a document failure.
+	client := OllamaHTTPClient()
+	if client == nil {
+		client = &http.Client{}
 	}
+	opts = append(opts, ollama.WithHTTPClient(WithUnavailableTransport(client)))
 	return ollama.New(opts...)
 }
 

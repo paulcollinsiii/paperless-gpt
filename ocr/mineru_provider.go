@@ -201,15 +201,34 @@ func describeErrorValue(raw json.RawMessage) string {
 	return string(raw)
 }
 
-// mineruHTTPError is a non-2xx response from the MinerU API.
+// mineruHTTPError is a non-2xx response from the MinerU API. A 502 or 503
+// means the service (or the proxy in front of it) has no ready backend, so it
+// also matches ErrBackendUnavailable; other statuses are failures of the
+// request itself.
 type mineruHTTPError struct {
 	stage  string
 	status int
 	msg    string
 }
 
+func mineruStatusError(stage string, status int, body []byte) error {
+	return &mineruHTTPError{stage: stage, status: status, msg: describeMinerUError(body)}
+}
+
 func (e *mineruHTTPError) Error() string {
-	return fmt.Sprintf("mineru %s: HTTP %d: %s", e.stage, e.status, e.msg)
+	msg := fmt.Sprintf("mineru %s: HTTP %d: %s", e.stage, e.status, e.msg)
+	if e.Unwrap() != nil {
+		msg += ": " + ErrBackendUnavailable.Error()
+	}
+	return msg
+}
+
+// Unwrap returns ErrBackendUnavailable for a 502 or 503, and nil otherwise.
+func (e *mineruHTTPError) Unwrap() error {
+	if e.status == http.StatusBadGateway || e.status == http.StatusServiceUnavailable {
+		return ErrBackendUnavailable
+	}
+	return nil
 }
 
 // transient reports whether retrying the same request may succeed.
@@ -276,11 +295,11 @@ func (p *MinerUProvider) request(ctx context.Context, stage, method, target stri
 			data = data[:limit]
 		}
 		if resp.StatusCode >= 500 && i < attempts-1 {
-			lastErr = &mineruHTTPError{stage: stage, status: resp.StatusCode, msg: describeMinerUError(data)}
+			lastErr = mineruStatusError(stage, resp.StatusCode, data)
 			continue
 		}
 		if resp.StatusCode >= 400 {
-			return nil, &mineruHTTPError{stage: stage, status: resp.StatusCode, msg: describeMinerUError(data)}
+			return nil, mineruStatusError(stage, resp.StatusCode, data)
 		}
 		var env struct {
 			Error json.RawMessage `json:"error"`
