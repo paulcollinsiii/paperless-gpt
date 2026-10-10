@@ -1368,7 +1368,7 @@ func createLLM() (llms.Model, error) {
 		}
 		var config OllamaMetadataConfig
 		applyOllamaMetadataEnvironment(&config)
-		llm, err := newOllamaMetadataModel(host, llmModel, 0, nil, 0, ollamaHTTPClientWithTimeout(), config)
+		llm, err := newOllamaMetadataModel(host, llmModel, 0, nil, 0, ollamaLLMHTTPClient(), config)
 		if err != nil {
 			return nil, err
 		}
@@ -1485,7 +1485,7 @@ func createVisionLLM() (llms.Model, error) {
 				log.Warnf("Invalid OLLAMA_CONTEXT_LENGTH value: %v, ignoring", err)
 			}
 		}
-		if client := ollamaHTTPClientWithTimeout(); client != nil {
+		if client := ollamaLLMHTTPClient(); client != nil {
 			opts = append(opts, ollama.WithHTTPClient(client))
 		}
 		llm, err := ollama.New(opts...)
@@ -1542,6 +1542,18 @@ func ollamaRequestTimeout() time.Duration {
 		log.Warnf("Invalid OLLAMA_TIMEOUT_SECONDS value: %q, using default 300s", raw)
 	}
 	return 300 * time.Second
+}
+
+// ollamaLLMHTTPClient is the client for every Ollama LLM call (suggestions and
+// vision). It is ollamaHTTPClientWithTimeout plus a transport that reports HTTP
+// 502/503 as ocr.ErrBackendUnavailable, which is how a service mesh answers
+// while Ollama is scaled to zero or still starting. It is never nil.
+func ollamaLLMHTTPClient() *http.Client {
+	client := ollamaHTTPClientWithTimeout()
+	if client == nil {
+		client = &http.Client{}
+	}
+	return ocr.WithUnavailableTransport(client)
 }
 
 // ollamaHTTPClientWithTimeout wraps the optional header-injecting client from
