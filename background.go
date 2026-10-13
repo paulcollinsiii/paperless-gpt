@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sync"
 	"time"
+
+	"paperless-gpt/ocr"
 
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -51,11 +54,131 @@ type BackgroundProcessor interface {
 	isOcrEnabled() bool
 }
 
+const (
+	minBackoffDuration           = 10 * time.Second
+	maxBackoffDuration           = time.Hour
+	defaultUnavailableMaxBackoff = 2 * time.Minute
+)
+
+// unavailableMaxBackoffFromEnv reads UNAVAILABLE_MAX_BACKOFF, the longest the
+// poll loop waits between cycles while a backend (OCR service, LLM server) is
+// unreachable. Invalid or non-positive values fall back to the default.
+func unavailableMaxBackoffFromEnv() time.Duration {
+	raw := os.Getenv("UNAVAILABLE_MAX_BACKOFF")
+	if raw == "" {
+		return defaultUnavailableMaxBackoff
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		log.Warnf("Invalid UNAVAILABLE_MAX_BACKOFF value %q (must be a positive duration such as 2m), using %v", raw, defaultUnavailableMaxBackoff)
+		return defaultUnavailableMaxBackoff
+	}
+	return d
+}
+
+// batchError aggregates the per-document (or per-poll) errors of one batch.
+// It is a distinct type, rather than a bare errors.Join, so that
+// allBackendUnavailable can tell "several independent failures" apart from a
+// single error that happens to wrap several causes (fmt.Errorf with two %w).
+type batchError struct {
+	members []error
+	msg     string
+}
+
+func (e *batchError) Error() string   { return e.msg }
+func (e *batchError) Unwrap() []error { return e.members }
+
+// joinBatch combines errors like errors.Join (same message, nil entries
+// dropped, nil when there are none) but returns a *batchError.
+func joinBatch(errs ...error) error {
+	joined := errors.Join(errs...)
+	if joined == nil {
+		return nil
+	}
+	members := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			members = append(members, err)
+		}
+	}
+	return &batchError{members: members, msg: joined.Error()}
+}
+
+// allBackendUnavailable reports whether every failure in err is a "backend
+// unavailable" error (see ocr.IsBackendUnavailable). Batches are checked
+// member by member, so one ordinary failure among unreachable-backend failures
+// makes the result false. Any other error, however many causes it wraps, is
+// classified as a whole: it is unavailable when its chain says so.
+func allBackendUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	for e := err; e != nil; {
+		if batch, ok := e.(*batchError); ok {
+			for _, member := range batch.members {
+				if !allBackendUnavailable(member) {
+					return false
+				}
+			}
+			return len(batch.members) > 0
+		}
+		wrapper, ok := e.(interface{ Unwrap() error })
+		if !ok {
+			break
+		}
+		e = wrapper.Unwrap()
+	}
+	return ocr.IsBackendUnavailable(err)
+}
+
+// nextBackoff returns how long to sleep after a failed cycle and the backoff to
+// use after that one. It starts at minBackoffDuration and doubles per failing
+// cycle. Ordinary failures are capped at maxBackoffDuration; cycles whose
+// errors are all "backend unavailable" are capped at unavailableMax, so the loop
+// resumes soon after a scaled-to-zero backend comes back.
+func nextBackoff(current time.Duration, unavailable bool, unavailableMax time.Duration) (sleep, next time.Duration) {
+	limit := maxBackoffDuration
+	if unavailable {
+		limit = unavailableMax
+	}
+	sleep = min(current, limit)
+	next = min(sleep*2, limit)
+	return sleep, next
+}
+
+// runBackgroundCycle runs one OCR poll and one auto-tag poll. An ordinary OCR
+// error ends the cycle early, as before. An OCR error that only says the OCR
+// backend is unavailable does not: the auto-tag poll still runs, since it may
+// use a different backend, and the errors are reported together.
+func runBackgroundCycle(ctx context.Context, app BackgroundProcessor) (count int, err error) {
+	var ocrErr error
+	// If OCR is enabled, run OCR tagging first
+	if app.isOcrEnabled() {
+		ocrCount, err := app.processAutoOcrTagDocuments(ctx)
+		count += ocrCount
+		if err != nil {
+			ocrErr = fmt.Errorf("error in processAutoOcrTagDocuments: %w", err)
+			if !allBackendUnavailable(err) {
+				return count, ocrErr
+			}
+		}
+	}
+
+	// Run auto-tagging after OCR
+	autoCount, err := app.processAutoTagDocuments(ctx)
+	count += autoCount
+	if err != nil {
+		return count, joinBatch(ocrErr, fmt.Errorf("error in processAutoTagDocuments: %w", err))
+	}
+
+	return count, ocrErr
+}
+
 // Start our background tasks in a goroutine
 func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
+	unavailableMax := unavailableMaxBackoffFromEnv()
+
 	go func() {
-		minBackoffDuration := 10 * time.Second
-		maxBackoffDuration := time.Hour
 		pollingInterval := 10 * time.Second
 
 		backoffDuration := minBackoffDuration
@@ -68,38 +191,18 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 			default: // needed to make this non-blocking
 			}
 
-			processedCount, err := func() (count int, err error) {
-				count = 0
-
-				// If OCR is enabled, run OCR tagging first
-				if app.isOcrEnabled() {
-					ocrCount, err := app.processAutoOcrTagDocuments(ctx)
-					if err != nil {
-						return 0, fmt.Errorf("error in processAutoOcrTagDocuments: %w", err)
-					}
-					count += ocrCount
-				}
-
-				// Run auto-tagging after OCR
-				autoCount, err := app.processAutoTagDocuments(ctx)
-				if err != nil {
-					return 0, fmt.Errorf("error in processAutoTagDocuments: %w", err)
-				}
-				count += autoCount
-
-				return count, nil
-			}()
+			processedCount, err := runBackgroundCycle(ctx, app)
 
 			if err != nil {
-				log.Errorf("Error in background tagging: %v", err)
-				time.Sleep(backoffDuration)
-
-				// Exponential backoff logic
-				backoffDuration *= 2
-				if backoffDuration > maxBackoffDuration {
-					log.Warnf("Max backoff duration reached. Using %v", maxBackoffDuration)
-					backoffDuration = maxBackoffDuration
+				unavailable := allBackendUnavailable(err)
+				var sleep time.Duration
+				sleep, backoffDuration = nextBackoff(backoffDuration, unavailable, unavailableMax)
+				if unavailable {
+					log.Warnf("Backend unavailable, will retry in %v: %v", sleep, err)
+				} else {
+					log.Errorf("Error in background tagging: %v", err)
 				}
+				time.Sleep(sleep)
 			} else {
 				// Reset backoff when processing succeeds
 				backoffDuration = minBackoffDuration
@@ -213,7 +316,7 @@ func (app *App) processAutoTagDocuments(ctx context.Context) (int, error) {
 		}
 	}
 	if len(allErrs) > 0 {
-		return totalProcessed, errors.Join(allErrs...)
+		return totalProcessed, joinBatch(allErrs...)
 	}
 	return totalProcessed, nil
 }
@@ -281,6 +384,9 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 				updatedDoc, ocrErr := app.runWorkflowDocumentOCR(ctx, document, wf, triggerTag, docLogger)
 				if ocrErr != nil {
 					errs = append(errs, ocrErr)
+					if ocr.IsBackendUnavailable(ocrErr) {
+						break
+					}
 					continue
 				}
 				if updatedDoc == nil {
@@ -299,6 +405,15 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 		suggestions, err := app.generateDocumentSuggestions(ctx, suggestionRequest, docLogger)
 		if err != nil {
 			err = fmt.Errorf("error generating suggestions for document %d: %w", document.ID, err)
+
+			// An unreachable LLM backend says nothing about this document: don't
+			// count it toward autoTagMaxRetries or fail-tag it, and skip the rest
+			// of the batch, which would hit the same backend.
+			if ocr.IsBackendUnavailable(err) {
+				docLogger.Warnf("LLM backend unavailable, leaving the remaining documents for the next cycle: %v", err)
+				errs = append(errs, err)
+				break
+			}
 			docLogger.Error(err.Error())
 
 			// Without a loop-break here the auto tag stays on the document and
@@ -373,7 +488,7 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 	}
 
 	if len(errs) > 0 {
-		return processedCount, errors.Join(errs...)
+		return processedCount, joinBatch(errs...)
 	}
 
 	return processedCount, nil
@@ -436,6 +551,13 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		docLogger.Errorf("Workflow OCR processing failed: %v", err)
 		jobStore.updateJobStatus(jobID, "failed", err.Error())
 		finishOCRRunLogged(app, jobID, "failed", err.Error(), pagesDone, totalPages, "", "")
+
+		// An unreachable OCR backend is not this document's fault: don't count
+		// it. The caller ends the batch on this error.
+		if ocr.IsBackendUnavailable(err) {
+			docLogger.Warnf("OCR backend unavailable, leaving the document for the next cycle: %v", err)
+			return nil, fmt.Errorf("document %d workflow OCR error: %w", document.ID, err)
+		}
 
 		if ocrMaxRetries > 0 && ctx.Err() == nil {
 			attempts := app.ocrFailures.recordFailure(document.ID)
@@ -606,6 +728,16 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 			jobStore.updateJobStatus(jobID, "failed", err.Error())
 			finishOCRRunLogged(app, jobID, "failed", err.Error(), pagesDone, totalPages, "", "")
 
+			// An unreachable OCR backend says nothing about this document, so
+			// it is not counted toward ocrMaxRetries and never fail-tagged. The
+			// next document would hit the same backend, so end the batch and
+			// let the loop back off.
+			if ocr.IsBackendUnavailable(err) {
+				docLogger.Warnf("OCR backend unavailable, leaving the remaining documents for the next cycle: %v", err)
+				errs = append(errs, fmt.Errorf("document %d OCR error: %w", document.ID, err))
+				break
+			}
+
 			// A canceled/expired poll-loop context is a shutdown, not a
 			// document problem — never count it against the document.
 			// Deliberately checked on ctx rather than via errors.Is on err:
@@ -698,7 +830,7 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 	}
 
 	if len(errs) > 0 {
-		return successCount, fmt.Errorf("one or more errors occurred: %w", errors.Join(errs...))
+		return successCount, fmt.Errorf("one or more errors occurred: %w", joinBatch(errs...))
 	}
 
 	return successCount, nil
